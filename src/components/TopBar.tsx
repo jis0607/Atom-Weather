@@ -10,6 +10,7 @@ import {
   X,
 } from 'lucide-react';
 import type { TemperatureUnit, ThemeMode, WeatherLocation } from '../types/weather.ts';
+import { searchCities } from '../lib/weatherApi.ts';
 
 interface TopBarProps {
   unit: TemperatureUnit;
@@ -70,27 +71,21 @@ export function TopBar({
       setIsSearching(true);
       setSearchError(null);
       try {
-        const res = await fetch(`/api/geocode?q=${encodeURIComponent(trimmed)}`, {
-          signal: controller.signal,
-        });
-        const data = (await res.json()) as { results?: WeatherLocation[]; error?: string };
-        if (!res.ok) {
-          setSearchError(data.error || 'Could not search cities.');
-          setResults([]);
-        } else {
-          setResults(data.results ?? []);
-          setActiveIndex(-1);
-          setIsOpen(true);
-        }
+        const list = await searchCities(trimmed, controller.signal);
+        setResults(list);
+        setActiveIndex(-1);
+        setIsOpen(true);
       } catch (err) {
         if ((err as Error).name !== 'AbortError') {
-          setSearchError('Unable to reach city search service.');
+          setSearchError(err instanceof Error ? err.message : 'Unable to reach city search service.');
           setResults([]);
         }
       } finally {
-        setIsSearching(false);
+        if (!controller.signal.aborted) {
+          setIsSearching(false);
+        }
       }
-    }, 260);
+    }, 220);
 
     return () => {
       window.clearTimeout(timer);
@@ -106,7 +101,7 @@ export function TopBar({
     setSearchError(null);
   }
 
-  function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
+  async function handleKeyDown(e: React.KeyboardEvent<HTMLInputElement>) {
     if (!isOpen && e.key === 'ArrowDown' && results.length > 0) {
       setIsOpen(true);
       return;
@@ -127,8 +122,21 @@ export function TopBar({
         handlePick(results[activeIndex]);
       } else if (results.length > 0) {
         handlePick(results[0]);
-      } else if (query.trim().length >= 2 && !isSearching) {
+      } else if (query.trim().length >= 2) {
+        setIsSearching(true);
+        setSearchError(null);
         setIsOpen(true);
+        try {
+          const list = await searchCities(query.trim());
+          setResults(list);
+          if (list.length > 0) {
+            handlePick(list[0]);
+          }
+        } catch (err) {
+          setSearchError(err instanceof Error ? err.message : 'Unable to reach city search service.');
+        } finally {
+          setIsSearching(false);
+        }
       }
     }
   }

@@ -15,6 +15,11 @@ import { WeatherInsightsPanel } from './components/WeatherInsightsPanel.tsx';
 import { HourlyForecastSection } from './components/HourlyForecastSection.tsx';
 import { SevenDayForecast } from './components/SevenDayForecast.tsx';
 import { DashboardSkeleton } from './components/DashboardSkeleton.tsx';
+import {
+  fetchGeminiInsights,
+  fetchWeatherForLocation,
+  reverseGeocodeCoords,
+} from './lib/weatherApi.ts';
 
 const DEFAULT_LOCATION: WeatherLocation = {
   id: '37.7749,-122.4194',
@@ -125,6 +130,16 @@ export default function App() {
 
   const weatherAbortRef = useRef<AbortController | null>(null);
   const insightsAbortRef = useRef<AbortController | null>(null);
+  const weatherRef = useRef<WeatherResponse | null>(null);
+  const unitRef = useRef<TemperatureUnit>(unit);
+
+  useEffect(() => {
+    weatherRef.current = weather;
+  }, [weather]);
+
+  useEffect(() => {
+    unitRef.current = unit;
+  }, [unit]);
 
   // Sync theme to <html> element
   useEffect(() => {
@@ -159,40 +174,36 @@ export default function App() {
     }
   }, [favorites]);
 
-  const fetchInsights = useCallback(async (data: WeatherResponse, displayUnit: TemperatureUnit) => {
-    insightsAbortRef.current?.abort();
-    const controller = new AbortController();
-    insightsAbortRef.current = controller;
+  const fetchInsights = useCallback(
+    async (data: WeatherResponse, displayUnit: TemperatureUnit, force = false) => {
+      insightsAbortRef.current?.abort();
+      const controller = new AbortController();
+      insightsAbortRef.current = controller;
 
-    setIsLoadingInsights(true);
-    setInsightsError(null);
+      setIsLoadingInsights(true);
+      setInsightsError(null);
 
-    try {
-      const res = await fetch('/api/insights', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ weather: data, unit: displayUnit }),
-        signal: controller.signal,
-      });
-
-      const payload = (await res.json()) as WeatherInsightsResponse & { error?: string };
-      if (!res.ok) {
-        setInsightsError(payload.error || 'Unable to generate AI weather insights.');
-        setInsights(null);
-      } else {
-        setInsights(payload);
+      try {
+        const payload = await fetchGeminiInsights(data, displayUnit, {
+          signal: controller.signal,
+          force,
+        });
+        if (!controller.signal.aborted) {
+          setInsights(payload);
+        }
+      } catch (err) {
+        if ((err as Error).name !== 'AbortError') {
+          setInsightsError(err instanceof Error ? err.message : 'Unable to generate AI weather insights.');
+          setInsights(null);
+        }
+      } finally {
+        if (insightsAbortRef.current === controller) {
+          setIsLoadingInsights(false);
+        }
       }
-    } catch (err) {
-      if ((err as Error).name !== 'AbortError') {
-        setInsightsError('Network error while contacting the weather insights service.');
-        setInsights(null);
-      }
-    } finally {
-      if (insightsAbortRef.current === controller) {
-        setIsLoadingInsights(false);
-      }
-    }
-  }, []);
+    },
+    [],
+  );
 
   const loadWeather = useCallback(
     async (loc: WeatherLocation, options?: { isRefresh?: boolean; activeUnit?: TemperatureUnit }) => {
@@ -200,7 +211,7 @@ export default function App() {
       const controller = new AbortController();
       weatherAbortRef.current = controller;
 
-      if (options?.isRefresh && weather) {
+      if (options?.isRefresh && weatherRef.current) {
         setIsRefreshing(true);
       } else {
         setIsLoadingWeather(true);
@@ -208,47 +219,42 @@ export default function App() {
       setWeatherError(null);
 
       try {
-        const params = new URLSearchParams({
-          lat: String(loc.latitude),
-          lon: String(loc.longitude),
-          name: loc.name,
-        });
-        if (loc.admin1) params.set('admin1', loc.admin1);
-        if (loc.country) params.set('country', loc.country);
-        if (loc.countryCode) params.set('countryCode', loc.countryCode);
-
-        const res = await fetch(`/api/weather?${params.toString()}`, {
+        const payload = await fetchWeatherForLocation(loc, {
           signal: controller.signal,
+          forceRefresh: Boolean(options?.isRefresh),
         });
 
-        const payload = (await res.json()) as WeatherResponse & { error?: string };
-        if (!res.ok) {
-          setWeatherError(payload.error || 'Failed to load weather data for this location.');
-          setIsLoadingWeather(false);
-          setIsRefreshing(false);
-          return;
-        }
+        if (controller.signal.aborted) return;
 
         setWeather(payload);
+        setActiveLocation((prev) =>
+          prev.id === loc.id && payload.location.name && prev.name === 'Current Location'
+            ? { ...prev, name: payload.location.name }
+            : prev,
+        );
         setIsLoadingWeather(false);
         setIsRefreshing(false);
 
         try {
-          localStorage.setItem('atmos-last-location', JSON.stringify(loc));
+          localStorage.setItem('atmos-last-location', JSON.stringify(payload.location));
         } catch {
           // ignore
         }
 
-        void fetchInsights(payload, options?.activeUnit ?? unit);
+        void fetchInsights(payload, options?.activeUnit ?? unitRef.current, Boolean(options?.isRefresh));
       } catch (err) {
         if ((err as Error).name !== 'AbortError') {
-          setWeatherError('Could not connect to the weather forecast service. Please check your connection and try again.');
+          setWeatherError(
+            err instanceof Error
+              ? err.message
+              : 'Could not connect to the weather forecast service. Please check your connection and try again.',
+          );
           setIsLoadingWeather(false);
           setIsRefreshing(false);
         }
       }
     },
-    [fetchInsights, unit, weather],
+    [fetchInsights],
   );
 
   // Initial weather load + passive check if geolocation permission is already granted
@@ -271,20 +277,9 @@ export default function App() {
           if (perm.state === 'granted') {
             navigator.geolocation.getCurrentPosition(
               async (pos) => {
-                try {
-                  const res = await fetch(
-                    `/api/reverse-geocode?lat=${pos.coords.latitude}&lon=${pos.coords.longitude}`,
-                  );
-                  const data = (await res.json()) as { location?: WeatherLocation };
-                  if (data.location) {
-                    setActiveLocation(data.location);
-                    void loadWeather(data.location);
-                    return;
-                  }
-                } catch {
-                  // fall back to default
-                }
-                void loadWeather(activeLocation);
+                const loc = await reverseGeocodeCoords(pos.coords.latitude, pos.coords.longitude);
+                setActiveLocation(loc);
+                void loadWeather(loc);
               },
               () => {
                 void loadWeather(activeLocation);
@@ -305,6 +300,7 @@ export default function App() {
 
   function handleSelectLocation(loc: WeatherLocation) {
     setLocationNotice(null);
+    setWeatherError(null);
     setActiveLocation(loc);
     void loadWeather(loc);
   }
@@ -325,23 +321,24 @@ export default function App() {
 
     setIsLocating(true);
     setLocationNotice(null);
+    setWeatherError(null);
 
     navigator.geolocation.getCurrentPosition(
       async (pos) => {
+        const { latitude, longitude } = pos.coords;
         try {
-          const { latitude, longitude } = pos.coords;
-          const res = await fetch(`/api/reverse-geocode?lat=${latitude}&lon=${longitude}`);
-          const data = (await res.json()) as { location?: WeatherLocation; error?: string };
-          const resolved: WeatherLocation = data.location ?? {
+          const resolved = await reverseGeocodeCoords(latitude, longitude);
+          setActiveLocation(resolved);
+          await loadWeather(resolved);
+        } catch {
+          const fallbackLoc: WeatherLocation = {
             id: `${latitude.toFixed(4)},${longitude.toFixed(4)}`,
             name: 'Current Location',
             latitude,
             longitude,
           };
-          setActiveLocation(resolved);
-          await loadWeather(resolved);
-        } catch {
-          setLocationNotice('Found your coordinates, but could not resolve the city name.');
+          setActiveLocation(fallbackLoc);
+          await loadWeather(fallbackLoc);
         } finally {
           setIsLocating(false);
         }
@@ -417,14 +414,25 @@ export default function App() {
             <p className="mt-2 text-sm text-slate-600 dark:text-slate-300 leading-relaxed">
               {weatherError}
             </p>
-            <button
-              type="button"
-              onClick={() => loadWeather(activeLocation)}
-              className="mt-5 inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-sky-600 hover:bg-sky-700 text-white transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
-            >
-              <RefreshCw className="w-4 h-4" aria-hidden="true" />
-              Try Again
-            </button>
+            <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
+              <button
+                type="button"
+                onClick={() => loadWeather(activeLocation)}
+                className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium bg-sky-600 hover:bg-sky-700 text-white transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-sky-500"
+              >
+                <RefreshCw className="w-4 h-4" aria-hidden="true" />
+                Try Again
+              </button>
+              {activeLocation.id !== DEFAULT_LOCATION.id && (
+                <button
+                  type="button"
+                  onClick={() => handleSelectLocation(DEFAULT_LOCATION)}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium border border-slate-200 dark:border-slate-700 text-slate-700 dark:text-slate-200 hover:bg-slate-100 dark:hover:bg-slate-800 transition-colors"
+                >
+                  Load San Francisco
+                </button>
+              )}
+            </div>
           </section>
         )}
 
@@ -448,7 +456,7 @@ export default function App() {
                   isLoading={isLoadingInsights}
                   error={insightsError}
                   alerts={weather.alerts}
-                  onRetry={() => fetchInsights(weather, unit)}
+                  onRetry={() => fetchInsights(weather, unit, true)}
                 />
               </div>
             </div>

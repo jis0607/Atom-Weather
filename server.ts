@@ -22,6 +22,35 @@ const __dirname = path.dirname(__filename);
 const PORT = Number(process.env.PORT || 3000);
 const isProduction = process.env.NODE_ENV === 'production';
 
+interface CacheEntry<T> {
+  value: T;
+  expiresAt: number;
+}
+
+const MAX_CACHE_SIZE = 100;
+const geocodeCache = new Map<string, CacheEntry<WeatherLocation[]>>();
+const reverseCache = new Map<string, CacheEntry<WeatherLocation>>();
+const weatherCache = new Map<string, CacheEntry<WeatherResponse>>();
+const insightsCache = new Map<string, CacheEntry<WeatherInsightsResponse>>();
+
+function getCached<T>(map: Map<string, CacheEntry<T>>, key: string): T | null {
+  const entry = map.get(key);
+  if (!entry) return null;
+  if (Date.now() > entry.expiresAt) {
+    map.delete(key);
+    return null;
+  }
+  return entry.value;
+}
+
+function setCached<T>(map: Map<string, CacheEntry<T>>, key: string, value: T, ttlMs: number): void {
+  if (map.size >= MAX_CACHE_SIZE) {
+    const oldestKey = map.keys().next().value;
+    if (oldestKey !== undefined) map.delete(oldestKey);
+  }
+  map.set(key, { value, expiresAt: Date.now() + ttlMs });
+}
+
 function getGeminiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY?.trim();
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
@@ -174,7 +203,7 @@ function computeSmartAlerts(
 
   // 6. Very High UV check
   const maxUv24 = Math.max(current.uvIndex, ...hourly24.map((h) => h.uvIndex));
-  if (maxUv24 >= 8) {
+  if (maxUv24 >= 8 && hourly24.length > 0) {
     const peakUvHour = hourly24.reduce((best, h) => (h.uvIndex > best.uvIndex ? h : best), hourly24[0]);
     alerts.push({
       id: 'alert-uv',
@@ -207,6 +236,13 @@ app.get('/api/geocode', async (req: Request, res: Response) => {
     return;
   }
 
+  const cacheKey = query.toLowerCase();
+  const cached = getCached(geocodeCache, cacheKey);
+  if (cached) {
+    res.json({ results: cached });
+    return;
+  }
+
   try {
     const url = new URL('https://geocoding-api.open-meteo.com/v1/search');
     url.searchParams.set('name', query);
@@ -215,7 +251,7 @@ app.get('/api/geocode', async (req: Request, res: Response) => {
     url.searchParams.set('format', 'json');
 
     const upstream = await fetch(url.toString(), {
-      signal: AbortSignal.timeout(8000),
+      signal: AbortSignal.timeout(7000),
     });
 
     if (!upstream.ok) {
@@ -249,6 +285,7 @@ app.get('/api/geocode', async (req: Request, res: Response) => {
       elevation: item.elevation,
     }));
 
+    setCached(geocodeCache, cacheKey, results, 10 * 60 * 1000);
     res.json({ results });
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unable to reach geocoding service.';
@@ -256,7 +293,7 @@ app.get('/api/geocode', async (req: Request, res: Response) => {
   }
 });
 
-// Reverse geocoding for browser geolocation
+// Reverse geocoding for browser geolocation (races BigDataCloud & Nominatim for low latency)
 app.get('/api/reverse-geocode', async (req: Request, res: Response) => {
   const lat = parseCoordinate(req.query.lat, -90, 90);
   const lon = parseCoordinate(req.query.lon, -180, 180);
@@ -266,95 +303,107 @@ app.get('/api/reverse-geocode', async (req: Request, res: Response) => {
     return;
   }
 
-  try {
+  const cacheKey = `${lat.toFixed(2)},${lon.toFixed(2)}`;
+  const cached = getCached(reverseCache, cacheKey);
+  if (cached) {
+    res.json({
+      location: {
+        ...cached,
+        id: `${lat.toFixed(4)},${lon.toFixed(4)}`,
+        latitude: lat,
+        longitude: lon,
+      },
+    });
+    return;
+  }
+
+  const fromBigDataCloud = async (): Promise<WeatherLocation> => {
+    const bdcUrl = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`;
+    const resp = await fetch(bdcUrl, { signal: AbortSignal.timeout(3500) });
+    if (!resp.ok) throw new Error(`BDC ${resp.status}`);
+    const ct = resp.headers.get('content-type') || '';
+    if (!ct.includes('json')) throw new Error('BDC non-json');
+    const bdc = (await resp.json()) as {
+      city?: string;
+      locality?: string;
+      principalSubdivision?: string;
+      countryName?: string;
+      countryCode?: string;
+    };
+    const name = bdc.city || bdc.locality || bdc.principalSubdivision;
+    if (!name) throw new Error('BDC empty');
+    return {
+      id: `${lat.toFixed(4)},${lon.toFixed(4)}`,
+      name,
+      admin1: bdc.principalSubdivision,
+      country: bdc.countryName,
+      countryCode: bdc.countryCode,
+      latitude: lat,
+      longitude: lon,
+    };
+  };
+
+  const fromNominatim = async (): Promise<WeatherLocation> => {
     const nominatimUrl = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${lat}&lon=${lon}&accept-language=en`;
-    const response = await fetch(nominatimUrl, {
+    const resp = await fetch(nominatimUrl, {
       headers: {
         'User-Agent': 'AtmosWeatherApp/1.0 (https://open-meteo.com)',
       },
-      signal: AbortSignal.timeout(6000),
+      signal: AbortSignal.timeout(4000),
     });
-
-    if (response.ok) {
-      const data = (await response.json()) as {
-        address?: {
-          city?: string;
-          town?: string;
-          village?: string;
-          municipality?: string;
-          suburb?: string;
-          county?: string;
-          state?: string;
-          country?: string;
-          country_code?: string;
-        };
-        name?: string;
-      };
-      const addr = data.address ?? {};
-      const cityName =
-        addr.city ||
-        addr.town ||
-        addr.village ||
-        addr.municipality ||
-        addr.suburb ||
-        addr.county ||
-        data.name;
-
-      if (cityName) {
-        const location: WeatherLocation = {
-          id: `${lat.toFixed(4)},${lon.toFixed(4)}`,
-          name: cityName,
-          admin1: addr.state || addr.county,
-          country: addr.country,
-          countryCode: addr.country_code?.toUpperCase(),
-          latitude: lat,
-          longitude: lon,
-        };
-        res.json({ location });
-        return;
-      }
-    }
-  } catch {
-    // Fall through to BigDataCloud fallback
-  }
-
-  try {
-    const bdcUrl = `https://api.bigdatacloud.net/data/reverse-geocode-client?latitude=${lat}&longitude=${lon}&localityLanguage=en`;
-    const fallbackResp = await fetch(bdcUrl, { signal: AbortSignal.timeout(6000) });
-    if (fallbackResp.ok) {
-      const bdc = (await fallbackResp.json()) as {
+    if (!resp.ok) throw new Error(`Nominatim ${resp.status}`);
+    const ct = resp.headers.get('content-type') || '';
+    if (!ct.includes('json')) throw new Error('Nominatim non-json');
+    const data = (await resp.json()) as {
+      address?: {
         city?: string;
-        locality?: string;
-        principalSubdivision?: string;
-        countryName?: string;
-        countryCode?: string;
+        town?: string;
+        village?: string;
+        municipality?: string;
+        suburb?: string;
+        county?: string;
+        state?: string;
+        country?: string;
+        country_code?: string;
       };
-      const name = bdc.city || bdc.locality || bdc.principalSubdivision || 'Current Location';
-      res.json({
-        location: {
-          id: `${lat.toFixed(4)},${lon.toFixed(4)}`,
-          name,
-          admin1: bdc.principalSubdivision,
-          country: bdc.countryName,
-          countryCode: bdc.countryCode,
-          latitude: lat,
-          longitude: lon,
-        } satisfies WeatherLocation,
-      });
-      return;
-    }
-  } catch {
-    // Fall through to coordinate label
-  }
-
-  res.json({
-    location: {
+      name?: string;
+    };
+    const addr = data.address ?? {};
+    const cityName =
+      addr.city ||
+      addr.town ||
+      addr.village ||
+      addr.municipality ||
+      addr.suburb ||
+      addr.county ||
+      data.name;
+    if (!cityName) throw new Error('Nominatim empty');
+    return {
       id: `${lat.toFixed(4)},${lon.toFixed(4)}`,
-      name: `Location (${lat.toFixed(2)}°, ${lon.toFixed(2)}°)`,
+      name: cityName,
+      admin1: addr.state || addr.county,
+      country: addr.country,
+      countryCode: addr.country_code?.toUpperCase(),
       latitude: lat,
       longitude: lon,
-    } satisfies WeatherLocation,
-  });
+    };
+  };
+
+  try {
+    const location = await Promise.any([fromBigDataCloud(), fromNominatim()]);
+    setCached(reverseCache, cacheKey, location, 30 * 60 * 1000);
+    res.json({ location });
+    return;
+  } catch {
+    res.json({
+      location: {
+        id: `${lat.toFixed(4)},${lon.toFixed(4)}`,
+        name: `Location (${lat.toFixed(2)}°, ${lon.toFixed(2)}°)`,
+        latitude: lat,
+        longitude: lon,
+      } satisfies WeatherLocation,
+    });
+  }
 });
 
 // Live weather forecast proxy (Open-Meteo Forecast API)
@@ -371,6 +420,29 @@ app.get('/api/weather', async (req: Request, res: Response) => {
   const admin1 = sanitizeText(req.query.admin1, 100);
   const country = sanitizeText(req.query.country, 100);
   const countryCode = sanitizeText(req.query.countryCode, 10);
+  const forceRefresh = req.query.refresh === '1';
+
+  const weatherCacheKey = `${lat.toFixed(2)},${lon.toFixed(2)}`;
+  if (!forceRefresh) {
+    const cachedWeather = getCached(weatherCache, weatherCacheKey);
+    if (cachedWeather) {
+      res.json({
+        ...cachedWeather,
+        location: {
+          ...cachedWeather.location,
+          id: `${lat.toFixed(4)},${lon.toFixed(4)}`,
+          name:
+            name && name !== 'Current Location'
+              ? name
+              : cachedWeather.location.name,
+          admin1: admin1 ?? cachedWeather.location.admin1,
+          country: country ?? cachedWeather.location.country,
+          countryCode: countryCode ?? cachedWeather.location.countryCode,
+        },
+      });
+      return;
+    }
+  }
 
   try {
     const url = new URL('https://api.open-meteo.com/v1/forecast');
@@ -578,7 +650,10 @@ app.get('/api/weather', async (req: Request, res: Response) => {
     const payload: WeatherResponse = {
       location: {
         id: `${lat.toFixed(4)},${lon.toFixed(4)}`,
-        name: name || raw.timezone.split('/').pop()?.replace(/_/g, ' ') || 'Selected Location',
+        name:
+          (name && name !== 'Current Location' ? name : undefined) ||
+          raw.timezone.split('/').pop()?.replace(/_/g, ' ') ||
+          'Current Location',
         admin1,
         country,
         countryCode,
@@ -598,6 +673,7 @@ app.get('/api/weather', async (req: Request, res: Response) => {
       alerts,
     };
 
+    setCached(weatherCache, weatherCacheKey, payload, 3 * 60 * 1000);
     res.json(payload);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Unable to fetch weather forecast.';
@@ -676,79 +752,103 @@ app.post('/api/insights', async (req: Request, res: Response) => {
     activeForecastAlerts: w.alerts.map((a) => `${a.title} (${a.metricLabel})`),
   };
 
-  const modelName = 'gemini-4-hydrogen';
-  const requestParams = {
-    model: modelName,
-    contents: `Analyze this verified Open-Meteo weather snapshot and produce practical, concise weather insights in ${unit === 'F' ? 'Fahrenheit/mph' : 'Celsius/km/h'} units:\n\n${JSON.stringify(groundedContext, null, 2)}`,
-    config: {
-      abortSignal: AbortSignal.timeout(12000),
-      thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
-      systemInstruction:
-        'You are an expert meteorologist for Atmos Weather. Strictly interpret ONLY the weather measurements and forecast values provided in the JSON payload. NEVER invent temperatures, rain amounts, UV levels, alerts, or events not present in the input. Keep prose crisp, practical, and direct—no filler, no hype, and no markdown formatting inside JSON string fields.',
-      responseMimeType: 'application/json',
-      responseSchema: {
+  const force = Boolean((body as { force?: boolean }).force);
+  const insightsCacheKey = `${w.location.latitude.toFixed(2)},${w.location.longitude.toFixed(2)},${unit},${w.current.time}`;
+  if (!force) {
+    const cachedInsights = getCached(insightsCache, insightsCacheKey);
+    if (cachedInsights) {
+      res.json(cachedInsights);
+      return;
+    }
+  }
+
+  const schemaConfig = {
+    type: Type.OBJECT,
+    properties: {
+      conditionSummary: {
+        type: Type.STRING,
+        description:
+          '2-3 sentences explaining current conditions (why it feels the way it does given temperature, humidity, wind, pressure) and key changes over the next 24 hours.',
+      },
+      clothingSuggestions: {
+        type: Type.ARRAY,
+        items: { type: Type.STRING },
+        description:
+          '3 concise, specific wardrobe or gear recommendations grounded in the observed temperature, wind, UV index, and rain probability.',
+      },
+      outdoorActivity: {
         type: Type.OBJECT,
         properties: {
-          conditionSummary: {
+          verdict: {
             type: Type.STRING,
-            description:
-              '2-3 sentences explaining current conditions (why it feels the way it does given temperature, humidity, wind, pressure) and key changes over the next 24 hours.',
+            description: 'Must be exactly one of: "Ideal", "Favorable", "Use Caution", "Not Recommended".',
           },
-          clothingSuggestions: {
-            type: Type.ARRAY,
-            items: { type: Type.STRING },
-            description:
-              '3 concise, specific wardrobe or gear recommendations grounded in the observed temperature, wind, UV index, and rain probability.',
-          },
-          outdoorActivity: {
-            type: Type.OBJECT,
-            properties: {
-              verdict: {
-                type: Type.STRING,
-                description: 'Must be exactly one of: "Ideal", "Favorable", "Use Caution", "Not Recommended".',
-              },
-              bestWindow: {
-                type: Type.STRING,
-                description: 'Short recommended time window from the 24-hour forecast, e.g. "Late afternoon (3 PM – 6 PM)" or "Early morning before rain".',
-              },
-              explanation: {
-                type: Type.STRING,
-                description: '1-2 sentences explaining outdoor suitability using actual wind, rain probability, temperature, and UV values.',
-              },
-            },
-            required: ['verdict', 'bestWindow', 'explanation'],
-          },
-          comfortNotes: {
+          bestWindow: {
             type: Type.STRING,
-            description: '1 concise sentence noting visibility, humidity comfort, UV timing, or the upcoming 3-day shift.',
+            description: 'Short recommended time window from the 24-hour forecast, e.g. "Late afternoon (3 PM – 6 PM)" or "Early morning before rain".',
+          },
+          explanation: {
+            type: Type.STRING,
+            description: '1-2 sentences explaining outdoor suitability using actual wind, rain probability, temperature, and UV values.',
           },
         },
-        required: ['conditionSummary', 'clothingSuggestions', 'outdoorActivity', 'comfortNotes'],
+        required: ['verdict', 'bestWindow', 'explanation'],
+      },
+      comfortNotes: {
+        type: Type.STRING,
+        description: '1 concise sentence noting visibility, humidity comfort, UV timing, or the upcoming 3-day shift.',
       },
     },
+    required: ['conditionSummary', 'clothingSuggestions', 'outdoorActivity', 'comfortNotes'],
   };
+
+  const promptText = `Analyze this verified Open-Meteo weather snapshot and produce practical, concise weather insights in ${unit === 'F' ? 'Fahrenheit/mph' : 'Celsius/km/h'} units:\n\n${JSON.stringify(groundedContext, null, 2)}`;
+  const sysInstr =
+    'You are an expert meteorologist for Atmos Weather. Strictly interpret ONLY the weather measurements and forecast values provided in the JSON payload. NEVER invent temperatures, rain amounts, UV levels, alerts, or events not present in the input. Keep prose crisp, practical, and direct—no filler, no hype, and no markdown formatting inside JSON string fields.';
+
+  const modelPlans: Array<{ model: string; thinkingLevel: ThinkingLevel; timeoutMs: number }> = [
+    { model: 'gemini-4-hydrogen', thinkingLevel: ThinkingLevel.LOW, timeoutMs: 8000 },
+    { model: 'gemini-3.1-flash-lite', thinkingLevel: ThinkingLevel.MINIMAL, timeoutMs: 10000 },
+  ];
 
   try {
     let response;
-    for (let attempt = 0; attempt < 2; attempt++) {
+    let usedModel = modelPlans[0].model;
+    let lastErr: unknown;
+
+    for (const plan of modelPlans) {
       try {
         response = await ai.models.generateContent({
-          ...requestParams,
+          model: plan.model,
+          contents: promptText,
           config: {
-            ...requestParams.config,
-            abortSignal: AbortSignal.timeout(12000),
+            abortSignal: AbortSignal.timeout(plan.timeoutMs),
+            thinkingConfig: { thinkingLevel: plan.thinkingLevel },
+            systemInstruction: sysInstr,
+            responseMimeType: 'application/json',
+            responseSchema: schemaConfig,
           },
         });
+        usedModel = plan.model;
+        lastErr = undefined;
         break;
       } catch (attemptErr) {
+        lastErr = attemptErr;
         const errText = attemptErr instanceof Error ? attemptErr.message : '';
-        const isTransient = errText.includes('503') || errText.includes('UNAVAILABLE') || errText.includes('500');
-        if (attempt === 0 && isTransient) {
-          await new Promise((r) => setTimeout(r, 1000));
-          continue;
+        if (
+          errText.includes('403') ||
+          errText.includes('PERMISSION_DENIED') ||
+          errText.includes('API_KEY_INVALID') ||
+          errText.includes('429') ||
+          errText.includes('RESOURCE_EXHAUSTED')
+        ) {
+          throw attemptErr;
         }
-        throw attemptErr;
       }
+    }
+
+    if (lastErr) {
+      throw lastErr;
     }
 
     const rawText = (response?.text ?? '').trim();
@@ -773,9 +873,10 @@ app.post('/api/insights', async (req: Request, res: Response) => {
       },
       comfortNotes: parsed.comfortNotes,
       generatedAt: new Date().toISOString(),
-      model: modelName,
+      model: usedModel,
     };
 
+    setCached(insightsCache, insightsCacheKey, result, 15 * 60 * 1000);
     res.json(result);
   } catch (err) {
     const msg = err instanceof Error ? err.message : 'Failed to generate weather insights.';
