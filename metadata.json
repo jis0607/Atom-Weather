@@ -1,0 +1,6 @@
+{
+  "name": "Atmos Weather",
+  "description": "Real-time global weather dashboard with 24-hour and 7-day forecasts, Recharts visualizations, forecast-derived advisories, and Gemini-powered weather insights.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
